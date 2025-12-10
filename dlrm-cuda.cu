@@ -37,78 +37,105 @@ torch::nn::Sequential make_mlp(
     return seq;
 }
 
-__global__ void interaction_kernel(
-    const float* __restrict__ z,        
-    const int64_t* __restrict__ pair_i, 
-    const int64_t* __restrict__ pair_j, 
-    float* __restrict__ out,           
+template <int D>
+__global__ void embed_interact_kernel(
+    const float* __restrict__ emb_w,    // [total_rows, D]
+    const int64_t* __restrict__ offsets,// [n_sparse]
+    const int64_t* __restrict__ sparse, // [B, n_sparse]
+    const int64_t* __restrict__ pair_i, // [n_int]
+    const int64_t* __restrict__ pair_j, // [n_int]
+    const float* __restrict__ z0,       // [B, D]
+    float* __restrict__ top_input,      // [B, D + n_int]
     int64_t B,
-    int64_t n_f,
-    int64_t D,
+    int64_t n_sparse,
     int64_t n_int) {
 
-  int64_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t total = B * n_int;
-  if (global_idx >= total) {
-    return;
-  }
+    extern __shared__ float shmem[];
+    float* z0_sh  = shmem;                     // D
+    float* emb_sh = z0_sh + D;                 // n_sparse * D
 
-  int64_t b    = global_idx / n_int;
-  int64_t pair = global_idx % n_int;
+    const int b = blockIdx.x;
+    if (b >= B) return;
 
-  int64_t i = pair_i[pair];
-  int64_t j = pair_j[pair];
+    // z0 로드
+    const float* z0_row = z0 + b * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        z0_sh[d] = z0_row[d];
+    }
 
-  const float* zi = z + ((b * n_f + i) * D);
-  const float* zj = z + ((b * n_f + j) * D);
+    // embedding gather
+    const int64_t* sparse_row = sparse + b * n_sparse;
+    for (int f = threadIdx.x; f < n_sparse; f += blockDim.x) {
+        int64_t local = sparse_row[f];
+        int64_t idx   = offsets[f] + local;
+        const float* src = emb_w + idx * D;
+        float*       dst = emb_sh + f * D;
 
-  float acc = 0.0f;
-#pragma unroll
-  for (int d = 0; d < D; ++d) {
-    acc += zi[d] * zj[d];
-  }
+    #pragma unroll
+        for (int d = 0; d < D; ++d) {
+        dst[d] = src[d];
+        }
+    }
 
-  out[b * n_int + pair] = acc;
+    __syncthreads();
+
+    // z0를 output 앞부분에 써주기
+    float* out_row = top_input + b * (D + n_int);
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        out_row[d] = z0_sh[d];
+    }
+
+    // 모든 (i,j) pair에 대해 dot product
+    for (int pair = threadIdx.x; pair < n_int; pair += blockDim.x) {
+        int i = static_cast<int>(pair_i[pair]);
+        int j = static_cast<int>(pair_j[pair]);
+
+        const float* vi = (i == 0) ? z0_sh : (emb_sh + (i - 1) * D);
+        const float* vj = (j == 0) ? z0_sh : (emb_sh + (j - 1) * D);
+
+        float acc = 0.0f;
+    #pragma unroll
+        for (int d = 0; d < D; ++d) {
+        acc += vi[d] * vj[d];
+        }
+
+        out_row[D + pair] = acc;
+    }
 }
 
+torch::Tensor embed_interact_cuda(
+    const torch::Tensor& z0,          // [B, D]
+    const torch::Tensor& sparse_x,    // [B, n_sparse]
+    const torch::Tensor& emb_weight,  // fused_embedding_->weight
+    const torch::Tensor& offsets,
+    const torch::Tensor& pair_i,
+    const torch::Tensor& pair_j) {
 
-torch::Tensor interact_cuda(
-    const torch::Tensor& z,          
-    const torch::Tensor& pair_i,     
-    const torch::Tensor& pair_j) {   
-  TORCH_CHECK(z.is_cuda(), "z must be CUDA tensor");
-  TORCH_CHECK(z.scalar_type() == torch::kFloat,
-              "interaction kernel currently supports float32 only");
+    const auto B        = z0.size(0);
+    const auto D        = z0.size(1);
+    const auto n_sparse = sparse_x.size(1);
+    const auto n_int    = pair_i.size(0);
 
-  const auto B = static_cast<int>(z.size(0));
-  const auto n_f = static_cast<int>(z.size(1));
-  const auto D = static_cast<int>(z.size(2));
-  const auto n_int = static_cast<int>(pair_i.size(0));
+    auto out = torch::empty({B, D + n_int}, z0.options());
 
-  auto out = torch::empty({z.size(0), pair_i.size(0)}, z.options());
+    dim3 grid(B);
+    int threads = 128;
+    size_t shmem_bytes = (D + n_sparse * D) * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream();
 
-  const int threads = 256;                      
-  int64_t total = B * n_int;                    
+    embed_interact_kernel<16><<<grid, threads, shmem_bytes, stream>>>(
+            emb_weight.data_ptr<float>(),
+            offsets.data_ptr<int64_t>(),
+            sparse_x.data_ptr<int64_t>(),
+            pair_i.data_ptr<int64_t>(),
+            pair_j.data_ptr<int64_t>(),
+            z0.data_ptr<float>(),
+            out.data_ptr<float>(),
+            B, n_sparse, n_int);
 
-  int blocks = static_cast<int>((total + threads - 1) / threads);
-
-  dim3 grid(blocks);
-  dim3 block(threads);
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-
-  interaction_kernel<<<grid, block, 0, stream>>>(
-      z.data_ptr<float>(),
-      pair_i.data_ptr<int64_t>(),
-      pair_j.data_ptr<int64_t>(),
-      out.data_ptr<float>(),
-      B, n_f, D, n_int);
-
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess,
-              "interaction_kernel launch failed: ", cudaGetErrorString(err));
-
-  return out;
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "embed_interact_kernel launch failed");
+    return out;
 }
 
 
@@ -197,41 +224,20 @@ struct DLRMOptimizedImpl : torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& dense_x,
                         const torch::Tensor& sparse_x) {
-    const auto B = dense_x.size(0);
-    TORCH_CHECK(sparse_x.size(1) == n_sparse_,
-                "Unexpected number of sparse fields");
+    auto z0 = bottom_mlp_->forward(dense_x); // [B, D]
 
-    auto z0 = bottom_mlp_->forward(dense_x); 
+    torch::Tensor top_input;
+    auto emb_weight = fused_embedding_->weight;
+    top_input = embed_interact_cuda(
+        z0,              // bottom MLP output
+        sparse_x,        // [B, n_sparse]
+        emb_weight,
+        offsets_,
+        pair_i_, pair_j_);
+    
 
-    // fused embedding lookup
-    // sparse_x: [B, n_sparse], 각 entry는 해당 테이블의 local index
-    // offsets_: [n_sparse], field 별 row offset
-    // fused_indices = sparse_x + offsets_ (broadcast)  -> [B, n_sparse]
-    // flat_indices: [B*n_sparse]
-    // fused_embedding_(flat_indices): [B*n_sparse, D] -> reshape [B, n_sparse, D]
+    auto logits = top_mlp_->forward(top_input);
 
-    auto fused_indices = sparse_x + offsets_.unsqueeze(0);
-    auto flat_indices = fused_indices.reshape({-1});
-
-    auto emb = fused_embedding_->forward(flat_indices); 
-    auto emb_reshaped = emb.view({B, n_sparse_, embedding_dim_}); 
-
-    auto z0_unsq = z0.unsqueeze(1); 
-    auto z = torch::cat({z0_unsq, emb_reshaped}, 1); 
-
-    torch::Tensor interactions;
-#if USE_CUSTOM_INTERACTION_KERNEL
-    if (z.is_cuda() && z.scalar_type() == torch::kFloat) {
-      interactions = interact_cuda(z, pair_i_, pair_j_);
-    } else
-#endif
-    {
-      auto zz = torch::bmm(z, z.transpose(1, 2));   
-      interactions = zz.index({Slice(), pair_i_, pair_j_});
-    }
-
-    auto top_input = torch::cat({z0, interactions}, 1);
-    auto logits = top_mlp_->forward(top_input); 
 
     return logits;
   }
