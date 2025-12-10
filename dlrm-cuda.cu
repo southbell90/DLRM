@@ -37,6 +37,7 @@ torch::nn::Sequential make_mlp(
     return seq;
 }
 
+// kernel fusion
 template <int D>
 __global__ void embed_interact_kernel(
     const float* __restrict__ emb_w,    // [total_rows, D]
