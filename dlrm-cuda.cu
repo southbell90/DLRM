@@ -1,290 +1,455 @@
-#include <torch/torch.h>
-#include <chrono>
-#include <iostream>
-#include <vector>
-#include <cuda_runtime.h>
-#include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAGraph.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h> 
+#include <memory>
 
-namespace F = torch::nn::functional;
+#include <torch/torch.h>
+#include <torch/cuda.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <utility>
+#include <vector>
+
 using torch::indexing::Slice;
 
-torch::nn::Sequential make_bottom_mlp(
+torch::nn::Sequential make_mlp(
     const std::vector<int64_t>& layer_sizes,
-    torch::nn::AnyModule output_activation = {}) {
+    bool use_output_activation = false) {
     torch::nn::Sequential seq;
-    const auto n = static_cast<int64_t>(layer_sizes.size());
+    const int64_t n = static_cast<int64_t>(layer_sizes.size());
     for (int64_t i = 0; i < n - 1; ++i) {
         const int64_t in_f = layer_sizes[i];
         const int64_t out_f = layer_sizes[i + 1];
         seq->push_back(torch::nn::Linear(in_f, out_f));
         const bool is_last = (i == n - 2);
-        if (is_last && output_activation.is_empty() == false) {
-            seq->push_back(output_activation);
+        if (is_last && use_output_activation) {
+        seq->push_back(torch::nn::Sigmoid());
         } else {
-            seq->push_back(torch::nn::ReLU());
+        seq->push_back(torch::nn::ReLU());
         }
     }
     return seq;
 }
 
-struct DLRMImpl : torch::nn::Module {
-    DLRMImpl(
-        int64_t num_dense_features,
-        const std::vector<int64_t>& sparse_feature_sizes,
-        int64_t embedding_dim,
-        const std::vector<int64_t>& bottom_mlp_sizes,
-        const std::vector<int64_t>& top_mlp_sizes)
-        : num_dense_features_(num_dense_features),
-          sparse_feature_sizes_(sparse_feature_sizes),
-          embedding_dim_(embedding_dim) {
-        
-        embeddings_ = register_module("embeddings", torch::nn::ModuleList());
-        for (auto n : sparse_feature_sizes_) {
-            embeddings_->push_back(torch::nn::Embedding(
-                torch::nn::EmbeddingOptions(n, embedding_dim_)));
-        }
+__global__ void interaction_kernel(
+    const float* __restrict__ z,        
+    const int64_t* __restrict__ pair_i, 
+    const int64_t* __restrict__ pair_j, 
+    float* __restrict__ out,           
+    int64_t B,
+    int64_t n_f,
+    int64_t D,
+    int64_t n_int) {
 
-        std::vector<int64_t> bottom_layers;
-        bottom_layers.reserve(bottom_mlp_sizes.size() + 1);
-        bottom_layers.push_back(num_dense_features_);
-        bottom_layers.insert(
-            bottom_layers.end(), bottom_mlp_sizes.begin(), bottom_mlp_sizes.end());
+  int64_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = B * n_int;
+  if (global_idx >= total) {
+    return;
+  }
 
-        if (bottom_layers.back() != embedding_dim_) {
-            throw std::runtime_error("Last bottom MLP size must equal embedding_dim.");
-        }
+  int64_t b    = global_idx / n_int;
+  int64_t pair = global_idx % n_int;
 
-        bottom_mlp_ = make_bottom_mlp(bottom_layers);
-        register_module("bottom_mlp", bottom_mlp_);
+  int64_t i = pair_i[pair];
+  int64_t j = pair_j[pair];
 
-        n_sparse_ = static_cast<int64_t>(sparse_feature_sizes_.size());
-        const int64_t n_f = n_sparse_ + 1;
-        n_int_ = n_f * (n_f - 1) / 2;
+  const float* zi = z + ((b * n_f + i) * D);
+  const float* zj = z + ((b * n_f + j) * D);
 
-        std::vector<int64_t> top_layers;
-        top_layers.reserve(top_mlp_sizes.size() + 1);
-        top_layers.push_back(embedding_dim_ + n_int_);
-        top_layers.insert(top_layers.end(), top_mlp_sizes.begin(), top_mlp_sizes.end());
+  float acc = 0.0f;
+#pragma unroll
+  for (int d = 0; d < D; ++d) {
+    acc += zi[d] * zj[d];
+  }
 
-        top_mlp_ = make_bottom_mlp(top_layers);
-        register_module("top_mlp", top_mlp_);
+  out[b * n_int + pair] = acc;
+}
+
+
+torch::Tensor interact_cuda(
+    const torch::Tensor& z,          
+    const torch::Tensor& pair_i,     
+    const torch::Tensor& pair_j) {   
+  TORCH_CHECK(z.is_cuda(), "z must be CUDA tensor");
+  TORCH_CHECK(z.scalar_type() == torch::kFloat,
+              "interaction kernel currently supports float32 only");
+
+  const auto B = static_cast<int>(z.size(0));
+  const auto n_f = static_cast<int>(z.size(1));
+  const auto D = static_cast<int>(z.size(2));
+  const auto n_int = static_cast<int>(pair_i.size(0));
+
+  auto out = torch::empty({z.size(0), pair_i.size(0)}, z.options());
+
+  const int threads = 256;                      
+  int64_t total = B * n_int;                    
+
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+
+  dim3 grid(blocks);
+  dim3 block(threads);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  interaction_kernel<<<grid, block, 0, stream>>>(
+      z.data_ptr<float>(),
+      pair_i.data_ptr<int64_t>(),
+      pair_j.data_ptr<int64_t>(),
+      out.data_ptr<float>(),
+      B, n_f, D, n_int);
+
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "interaction_kernel launch failed: ", cudaGetErrorString(err));
+
+  return out;
+}
+
+
+struct DLRMOptimizedImpl : torch::nn::Module {
+  DLRMOptimizedImpl(
+      int64_t num_dense_features,
+      const std::vector<int64_t>& sparse_feature_sizes,
+      int64_t embedding_dim,
+      const std::vector<int64_t>& bottom_mlp_sizes,
+      const std::vector<int64_t>& top_mlp_sizes)
+      : num_dense_features_(num_dense_features),
+        sparse_feature_sizes_(sparse_feature_sizes),
+        embedding_dim_(embedding_dim) {
+    // --- fused embedding 설정 ---
+    n_sparse_ = static_cast<int64_t>(sparse_feature_sizes_.size());
+
+    std::vector<int64_t> offsets_vec(n_sparse_);
+    int64_t prefix = 0;
+    for (int64_t i = 0; i < n_sparse_; ++i) {
+      offsets_vec[i] = prefix;
+      prefix += sparse_feature_sizes_[i];
+    }
+    total_rows_ = prefix;
+
+    offsets_ = torch::from_blob(
+                   offsets_vec.data(),
+                   {n_sparse_},
+                   torch::dtype(torch::kLong))
+                   .clone();  
+    register_buffer("offsets", offsets_);
+
+    fused_embedding_ = torch::nn::Embedding(
+        torch::nn::EmbeddingOptions(total_rows_, embedding_dim_));
+    register_module("fused_embedding", fused_embedding_);
+
+
+    std::vector<int64_t> bottom_layers;
+    bottom_layers.reserve(bottom_mlp_sizes.size() + 1);
+    bottom_layers.push_back(num_dense_features_);
+    bottom_layers.insert(
+        bottom_layers.end(), bottom_mlp_sizes.begin(), bottom_mlp_sizes.end());
+    if (bottom_layers.back() != embedding_dim_) {
+      throw std::runtime_error(
+          "Last bottom MLP size must equal embedding_dim for interactions.");
+    }
+    bottom_mlp_ = make_mlp(bottom_layers, /*use_output_activation=*/false);
+    register_module("bottom_mlp", bottom_mlp_);
+
+
+    const int64_t n_f = n_sparse_ + 1;
+    n_int_ = n_f * (n_f - 1) / 2;
+
+    std::vector<int64_t> pair_i_vec;
+    std::vector<int64_t> pair_j_vec;
+    pair_i_vec.reserve(n_int_);
+    pair_j_vec.reserve(n_int_);
+    for (int64_t i = 0; i < n_f; ++i) {
+      for (int64_t j = i + 1; j < n_f; ++j) {
+        pair_i_vec.push_back(i);
+        pair_j_vec.push_back(j);
+      }
     }
 
-    torch::Tensor forward(const torch::Tensor& dense_x, const torch::Tensor& sparse_x) {
-        
-        auto z0 = bottom_mlp_->forward(dense_x);
+    pair_i_ = torch::from_blob(
+                  pair_i_vec.data(),
+                  {n_int_},
+                  torch::dtype(torch::kLong))
+                  .clone();
+    pair_j_ = torch::from_blob(
+                  pair_j_vec.data(),
+                  {n_int_},
+                  torch::dtype(torch::kLong))
+                  .clone();
+    register_buffer("pair_i", pair_i_);
+    register_buffer("pair_j", pair_j_);
 
-        std::vector<torch::Tensor> emb_list;
-        emb_list.reserve(n_sparse_);
-        for (int64_t i = 0; i < n_sparse_; ++i) {
-            auto idx = sparse_x.index({Slice(), i});
-            emb_list.push_back(embeddings_[i]->as<torch::nn::Embedding>()->forward(idx));
-        }
 
-        std::vector<torch::Tensor> stack_inputs;
-        stack_inputs.reserve(1 + emb_list.size());
-        stack_inputs.push_back(z0);
-        stack_inputs.insert(stack_inputs.end(), emb_list.begin(), emb_list.end());
+    std::vector<int64_t> top_layers;
+    top_layers.reserve(top_mlp_sizes.size() + 1);
+    top_layers.push_back(embedding_dim_ + n_int_);
+    top_layers.insert(
+        top_layers.end(), top_mlp_sizes.begin(), top_mlp_sizes.end());
+    top_mlp_ = make_mlp(top_layers, true);
+    register_module("top_mlp", top_mlp_);
+  }
 
-        auto z = torch::stack(stack_inputs, 1); // [B, n_f, D]
-        auto zz = torch::bmm(z, z.transpose(1, 2)); // [B, n_f, n_f]
+  torch::Tensor forward(const torch::Tensor& dense_x,
+                        const torch::Tensor& sparse_x) {
+    const auto B = dense_x.size(0);
+    TORCH_CHECK(sparse_x.size(1) == n_sparse_,
+                "Unexpected number of sparse fields");
 
-        auto idx = torch::triu_indices(z.size(1), z.size(1), 1, 
-                                     torch::TensorOptions()
-                                         .device(z.device())
-                                         .dtype(torch::kLong));
-        
-        auto interactions = zz.index({Slice(), idx[0], idx[1]});
-        auto top_input = torch::cat({z0, interactions}, 1);
-        auto logits = top_mlp_->forward(top_input);
+    auto z0 = bottom_mlp_->forward(dense_x); 
 
-        return logits;
+    // fused embedding lookup
+    // sparse_x: [B, n_sparse], 각 entry는 해당 테이블의 local index
+    // offsets_: [n_sparse], field 별 row offset
+    // fused_indices = sparse_x + offsets_ (broadcast)  -> [B, n_sparse]
+    // flat_indices: [B*n_sparse]
+    // fused_embedding_(flat_indices): [B*n_sparse, D] -> reshape [B, n_sparse, D]
+
+    auto fused_indices = sparse_x + offsets_.unsqueeze(0);
+    auto flat_indices = fused_indices.reshape({-1});
+
+    auto emb = fused_embedding_->forward(flat_indices); 
+    auto emb_reshaped = emb.view({B, n_sparse_, embedding_dim_}); 
+
+    auto z0_unsq = z0.unsqueeze(1); 
+    auto z = torch::cat({z0_unsq, emb_reshaped}, 1); 
+
+    torch::Tensor interactions;
+#if USE_CUSTOM_INTERACTION_KERNEL
+    if (z.is_cuda() && z.scalar_type() == torch::kFloat) {
+      interactions = interact_cuda(z, pair_i_, pair_j_);
+    } else
+#endif
+    {
+      auto zz = torch::bmm(z, z.transpose(1, 2));   
+      interactions = zz.index({Slice(), pair_i_, pair_j_});
     }
 
-    torch::nn::Sequential get_bottom_mlp() { return bottom_mlp_; }
-    torch::nn::Sequential get_top_mlp() { return top_mlp_; }
-    torch::nn::ModuleList get_embeddings() { return embeddings_; }
+    auto top_input = torch::cat({z0, interactions}, 1);
+    auto logits = top_mlp_->forward(top_input); 
 
-private:
+    return logits;
+  }
+
+  torch::nn::Sequential& bottom_mlp() { return bottom_mlp_; }
+  torch::nn::Sequential& top_mlp() { return top_mlp_; }
+
+ private:
     int64_t num_dense_features_;
     std::vector<int64_t> sparse_feature_sizes_;
     int64_t embedding_dim_;
-    int64_t n_sparse_;
-    int64_t n_int_;
+    int64_t n_sparse_{0};
+    int64_t n_int_{0};
+    int64_t total_rows_{0};
 
-    torch::nn::ModuleList embeddings_{nullptr};
+    // fused embedding
+    torch::nn::Embedding fused_embedding_{nullptr};
+    torch::Tensor offsets_;  
+
+    // interaction index pairs
+    torch::Tensor pair_i_;  
+    torch::Tensor pair_j_;  
+
     torch::nn::Sequential bottom_mlp_{nullptr};
     torch::nn::Sequential top_mlp_{nullptr};
 };
-TORCH_MODULE(DLRM);
+TORCH_MODULE(DLRMOptimized);
 
+std::pair<void*, size_t> collect_mlp_address_range(
+    torch::nn::Sequential& mlp1,
+    torch::nn::Sequential& mlp2) {
+    uintptr_t min_addr = std::numeric_limits<uintptr_t>::max();
+    uintptr_t max_addr = 0;
 
-void pin_params_to_l2_cache(DLRM& model) {
-    if (!torch::cuda::is_available()) return;
+    auto visit_mlp = [&](torch::nn::Sequential& mlp) {
+        for (const auto& child : mlp->children()) {
+        // torch::nn::LinearImpl 로 다운캐스트
+        auto linear =
+            std::dynamic_pointer_cast<torch::nn::LinearImpl>(child);
+        if (!linear) {
+            continue;
+        }
 
-    std::vector<torch::Tensor> target_params;
-    int64_t pinned_embedding_count = 0;
-    
-    auto collect_mlp = [&](torch::nn::Sequential seq) {
-        for (auto& param : seq->parameters()) target_params.push_back(param);
+        // weight
+        auto weight = linear->weight;
+        if (weight.defined()) {
+            auto addr =
+                reinterpret_cast<uintptr_t>(weight.data_ptr());
+            size_t bytes = weight.numel() * weight.element_size();
+            min_addr = std::min(min_addr, addr);
+            max_addr = std::max(max_addr, addr + bytes);
+        }
+
+        // bias
+        auto bias = linear->bias;
+        if (bias.defined()) {
+            auto addr =
+                reinterpret_cast<uintptr_t>(bias.data_ptr());
+            size_t bytes = bias.numel() * bias.element_size();
+            min_addr = std::min(min_addr, addr);
+            max_addr = std::max(max_addr, addr + bytes);
+        }
+        }
     };
-    collect_mlp(model->get_bottom_mlp());
-    collect_mlp(model->get_top_mlp());
 
-    auto embeddings = model->get_embeddings();
-    for (int i = 0; i < embeddings->size(); ++i) {
-        auto emb_module = embeddings[i]->as<torch::nn::Embedding>();
-        if (emb_module->weight.size(0) <= 100000) {
-            target_params.push_back(emb_module->weight);
-            pinned_embedding_count++;
-        }
+    visit_mlp(mlp1);
+    visit_mlp(mlp2);
+
+    if (max_addr <= min_addr) {
+        return {nullptr, 0};
+    }
+    return {reinterpret_cast<void*>(min_addr),
+            max_addr - min_addr};
+}
+
+
+void setup_l2_persisting_for_mlp(void* base_ptr, size_t bytes) {
+    if (!base_ptr || bytes == 0) return;
+
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device_id);
+
+    if (prop.persistingL2CacheMaxSize == 0) {
+    return;
     }
 
-    if (target_params.empty()) return;
+    size_t window_bytes =
+        std::min(bytes, static_cast<size_t>(prop.accessPolicyMaxWindowSize));
+    size_t max_set_aside = static_cast<size_t>(prop.persistingL2CacheMaxSize);
+    size_t set_aside_bytes = std::min(window_bytes, max_set_aside);
 
-    int64_t total_elements = 0;
-    for (const auto& p : target_params) total_elements += p.numel();
-
-    auto options = target_params[0].options(); 
-    torch::Tensor big_buffer = torch::empty({total_elements}, options);
-
-    {
-        torch::NoGradGuard no_grad;
-        int64_t offset = 0;
-        for (auto& p : target_params) {
-            int64_t numel = p.numel();
-            auto flattened = p.view({-1});
-            auto buffer_slice = big_buffer.slice(0, offset, offset + numel);
-            buffer_slice.copy_(flattened);
-            p.set_data(buffer_slice.view(p.sizes()));
-            offset += numel;
-        }
-    }
-
-    size_t size_bytes = big_buffer.nbytes();
-    void* d_ptr = big_buffer.data_ptr();
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    size_t l2_limit = prop.persistingL2CacheMaxSize;
-    
-    // 안전하게 한도의 90%까지만 사용하도록 설정
-    size_t set_limit = std::min(size_bytes * 2, l2_limit);
-    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_limit);
-
-    cudaAccessPolicyWindow window;
-    window.base_ptr = d_ptr;
-    window.num_bytes = size_bytes;
-    window.hitRatio = 1.0f; 
-    window.hitProp = cudaAccessPropertyPersisting;
-    window.missProp = cudaAccessPropertyStreaming;
+    // L2 set-aside 영역 크기 설정
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside_bytes);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    cudaStreamAttrValue attr;
-    attr.accessPolicyWindow = window;
-    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
 
-    std::cout << "  - Pinned Size: " << (size_bytes / 1024.0 / 1024.0) << " MB" << std::endl;
-    std::cout << "  - Pinned Embeddings: " << pinned_embedding_count << std::endl;
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr = base_ptr;
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio =
+        static_cast<float>(window_bytes) / static_cast<float>(bytes);
+    if (attr.accessPolicyWindow.hitRatio > 1.0f)
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+    cudaStreamSetAttribute(stream,
+                            cudaStreamAttributeAccessPolicyWindow,
+                            &attr);
 }
 
 
 int main() {
     const int64_t num_dense_features = 13;
     const std::vector<int64_t> sparse_feature_sizes = {
-        1460, 583, 10131227, 2202608, 305, 24, 12517, 633, 3, 93145, 
-        5683, 8351593, 3194, 27, 14992, 5461306, 10, 5652, 2173, 4, 
-        7046547, 18, 15, 286181, 105, 142572};
+        1460, 583, 10131227, 2202608, 305, 24, 12517, 633, 3, 93145, 5683,
+        8351593, 3194, 27, 14992, 5461306, 10, 5652, 2173, 4, 7046547, 18,
+        15, 286181, 105, 142572};
     const int64_t embedding_dim = 16;
+
     const std::vector<int64_t> bottom_mlp_sizes = {512, 256, 64, 16};
     const std::vector<int64_t> top_mlp_sizes = {512, 256, 1};
 
-    if (!torch::cuda::is_available()) {
-        std::cerr << "CUDA is required for this optimization." << std::endl;
-        return -1;
-    }
-    auto device = torch::kCUDA;
-    std::cout << "Using device: CUDA (RTX 5090 Optimized)" << "\n";
+    const bool cuda_available = torch::cuda::is_available();
+    auto device = cuda_available ? torch::kCUDA : torch::kCPU;
+    std::cout << "Using device: " << (cuda_available ? "CUDA" : "CPU") << "\n";
 
-    DLRM model(num_dense_features, sparse_feature_sizes, embedding_dim, bottom_mlp_sizes, top_mlp_sizes);
+    DLRMOptimized model(
+        num_dense_features,
+        sparse_feature_sizes,
+        embedding_dim,
+        bottom_mlp_sizes,
+        top_mlp_sizes);
     model->to(device);
     model->eval();
 
-    torch::NoGradGuard no_grad;
+    if (cuda_available) {
+        auto range = collect_mlp_address_range(
+            model->bottom_mlp(), model->top_mlp());
+        setup_l2_persisting_for_mlp(range.first, range.second);
+    }
 
-    pin_params_to_l2_cache(model);
+    const int64_t n_sparse = static_cast<int64_t>(sparse_feature_sizes.size());
 
-    const int64_t batch_size = 32; 
-    const int64_t num_samples = 1'000'000;
+    const int64_t batch_size = 32768;
+    const int64_t num_samples = 6'000'000;
     const int64_t num_batches = num_samples / batch_size;
-    
-    auto static_dense_x = torch::randn({batch_size, num_dense_features}, 
-        torch::TensorOptions().device(device).dtype(torch::kFloat));
-    
-    std::vector<torch::Tensor> sparse_cols;
-    for (auto n : sparse_feature_sizes) {
-        sparse_cols.push_back(torch::randint(0, n, {batch_size}, 
-            torch::TensorOptions().device(device).dtype(torch::kLong)));
-    }
-    auto static_sparse_x = torch::stack(torch::TensorList(sparse_cols), 1);
-    
-    // 결과 저장용 텐서 (Graph 출력용)
-    torch::Tensor static_output;
 
-    std::cout << "Capturing CUDA Graph..." << std::endl;
-    
-    for(int i=0; i<3; ++i) {
-        model->forward(static_dense_x, static_sparse_x);
+    auto dense_opts = torch::TensorOptions()
+                            .device(device)
+                            .dtype(torch::kFloat);
+    auto idx_opts = torch::TensorOptions()
+                        .device(device)
+                        .dtype(torch::kLong);
+
+    torch::Tensor dense_static =
+        torch::empty({batch_size, num_dense_features}, dense_opts);
+    torch::Tensor sparse_static =
+        torch::empty({batch_size, n_sparse}, idx_opts);
+
+    torch::Tensor out_static;
+
+    if (cuda_available) {
+        torch::cuda::synchronize();
     }
+
+
+    std::cout << "Warming up and capturing CUDA graph...\n";
+
+    at::cuda::CUDAStream capture_stream = at::cuda::getStreamFromPool();
+    at::cuda::setCurrentCUDAStream(capture_stream);
+
+    // warmup용 입력
+    dense_static.normal_(0.0, 1.0);
+    for (int64_t i = 0; i < n_sparse; ++i) {
+        auto col = sparse_static.index({Slice(), i});
+        col.random_(0, sparse_feature_sizes[i]);
+    }
+
+    // warmup
+    out_static = model->forward(dense_static, sparse_static).squeeze(1);
     torch::cuda::synchronize();
 
+    // Graph capture
     at::cuda::CUDAGraph graph;
-
-    auto stream = at::cuda::getStreamFromPool();
-    {
-        c10::cuda::CUDAStreamGuard guard(stream);
-        
-        graph.capture_begin();
-        
-        static_output = model->forward(static_dense_x, static_sparse_x).squeeze(1);
-        
-        graph.capture_end();
-    }
-    torch::cuda::synchronize();
-    std::cout << "Graph captured successfully." << std::endl;
-
-    std::cout << "Starting Inference Loop..." << std::endl;
+    graph.capture_begin();
+    out_static = model->forward(dense_static, sparse_static).squeeze(1);
+    graph.capture_end();
 
 
-    auto host_dense = torch::randn({batch_size, num_dense_features}, torch::kFloat);
-    std::vector<torch::Tensor> host_sparse_vec;
-    for (auto n : sparse_feature_sizes) {
-        host_sparse_vec.push_back(torch::randint(0, n, {batch_size}, torch::kLong));
-    }
-    auto host_sparse = torch::stack(torch::TensorList(host_sparse_vec), 1);
-
-    if (torch::cuda::is_available()) torch::cuda::synchronize();
-    
     auto start = std::chrono::steady_clock::now();
 
     for (int64_t b = 0; b < num_batches; ++b) {
-        static_dense_x.copy_(host_dense, /*non_blocking=*/true);
-        static_sparse_x.copy_(host_sparse, /*non_blocking=*/true);
-        
+        dense_static.normal_(0.0, 1.0);
+        for (int64_t i = 0; i < n_sparse; ++i) {
+            auto col = sparse_static.index({Slice(), i});
+            col.random_(0, sparse_feature_sizes[i]);
+        }
+
         graph.replay();
+
     }
 
-    if (torch::cuda::is_available()) torch::cuda::synchronize();
-    
+    torch::cuda::synchronize();
     auto end = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(end - start).count();
-    
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "Inference time: " << elapsed << " s" << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    double elapsed =
+        std::chrono::duration<double>(end - start).count();
 
-    return 0;
+    std::cout << "CUDA Graph inference time: " << elapsed
+                << " s for " << num_batches
+                << " batches (batch_size=" << batch_size
+                << ", total_samples=" << (num_batches * batch_size)
+                << ").\n";
+
+  return 0;
 }
+
