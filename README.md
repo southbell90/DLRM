@@ -3,7 +3,7 @@
 DLRM(Deep Learning Recommendation Model)의
 - PyTorch 기반 기본/참고 구현(`dlrm-naive.ipynb`)
 - LibTorch + CUDA 최적화 구현 및 벤치마크(`dlrm-cuda.cu`)
-을 포함
+를 포함
 
 ## 구성
 - `dlrm-cuda.cu`: embedding + interaction 커널 fusion, CUDA Graph 등을 이용한 최적화 버전
@@ -22,7 +22,7 @@ DLRM(Deep Learning Recommendation Model)의
 mkdir -p build
 cd build
 cmake ..
-make -j
+cmake --build . -j
 ```
 
 ## 실행
